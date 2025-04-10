@@ -1,10 +1,6 @@
 pandas
 numpy
-matplotlib
-seaborn
-scikit-learn
-jupyter
-notebook
 pydantic
 sqlalchemy
 psycopg2
+streamlit

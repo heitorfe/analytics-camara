@@ -1,8 +1,15 @@
-# Use a imagem base do Python
-FROM python:3.13-alpine
+# Use a imagem base Python slim (baseada em Debian)
+FROM python:3.13-slim
 
 # Defina o diretório de trabalho
 WORKDIR /app
+
+# Instale as dependências necessárias para o psycopg2
+RUN apt-get update && apt-get install -y \
+    gcc \
+    python3-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copie os arquivos de requisitos e instale as dependências
 COPY requirements.txt .

@@ -1,9 +1,16 @@
 import argparse
 import logging
-from datetime import datetime, timedelta
 from typing import Dict, Any
 
-from .load import (
+
+import sys
+import os
+
+# Add the project root to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+
+from app.ingestion.load import (
     load_deputados, load_despesas, load_discursos, 
     load_votacoes, load_votos, run_full_etl
 )

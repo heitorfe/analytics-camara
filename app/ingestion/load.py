@@ -1,500 +1,466 @@
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import SQLAlchemyError
-from typing import List, Dict, Any, Optional, Union, Callable
 import logging
-from datetime import datetime, date
+from typing import Dict, List, Optional, Any, Tuple
 import pandas as pd
+from prefect import task
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
-# Import database
-from app.database.database import SessionLocal
-from app.database.models import Deputado, Despesa, Discurso, Votacao, Voto, Base
-
-# Import API functions
-from .api import (
-    obter_deputados, obter_detalhe_deputado, obter_despesas_deputado, 
-    obter_discursos_deputado, obter_votacoes, obter_votos_votacao
+from app.database.models import Deputado, Votacao, Voto
+from app.config import DATABASE_URL
+from app.ingestion.utils import load_dataframe, commit_to_db
+from app.ingestion.transform import (
+    transform_deputado,
+    transform_votacao,
+    transform_voto
 )
 
-# Import transform functions
-from .transform import (
-    transform_deputado, transform_despesa, transform_discurso,
-    transform_votacao, transform_voto, transform_dataframe_to_models
-)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_data(
-    models: List[Base], 
-    session: Session, 
-    incremental: bool = True, 
-    check_exists_func: Optional[Callable] = None
-) -> int:
+def get_db_session() -> Tuple[Session, Any]:
     """
-    Load data into database.
+    Create a database session.
     
-    Args:
-        models: List of SQLAlchemy model instances to insert/update
-        session: SQLAlchemy session
-        incremental: If True, only insert if not exists or update if changed
-        check_exists_func: Function to check if record already exists (incremental mode)
-        
     Returns:
-        Number of records inserted/updated
+        Tuple with session and engine
     """
-    if not models:
-        return 0
-    
-    count = 0
-    
     try:
-        if incremental and check_exists_func:
-            for model in models:
-                exists = check_exists_func(session, model)
-                if not exists:
-                    session.add(model)
-                    count += 1
-        else:
-            session.add_all(models)
-            count = len(models)
-        
-        session.commit()
-        return count
-    
-    except SQLAlchemyError as e:
-        session.rollback()
-        logger.error(f"Error loading data: {str(e)}")
-        raise
-    
+        engine = create_engine(DATABASE_URL)
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        session = SessionLocal()
+        return session, engine
     except Exception as e:
-        session.rollback()
-        logger.error(f"Unexpected error: {str(e)}")
+        logger.error(f"Error creating database session: {e}")
         raise
 
-def check_deputado_exists(session: Session, deputado: Deputado) -> bool:
-    """Check if deputy already exists in database"""
-    return session.query(Deputado).filter(Deputado.id == deputado.id).first() is not None
-
-def check_despesa_exists(session: Session, despesa: Despesa) -> bool:
-    """Check if expense already exists in database"""
-    return session.query(Despesa).filter(
-        Despesa.deputado_id == despesa.deputado_id,
-        Despesa.ano == despesa.ano,
-        Despesa.mes == despesa.mes,
-        Despesa.cod_documento == despesa.cod_documento
-    ).first() is not None
-
-def check_discurso_exists(session: Session, discurso: Discurso) -> bool:
-    """Check if speech already exists in database"""
-    return session.query(Discurso).filter(
-        Discurso.deputado_id == discurso.deputado_id,
-        Discurso.data_hora_inicio == discurso.data_hora_inicio
-    ).first() is not None
-
-def check_votacao_exists(session: Session, votacao: Votacao) -> bool:
-    """Check if voting session already exists in database"""
-    return session.query(Votacao).filter(Votacao.id == votacao.id).first() is not None
-
-def check_voto_exists(session: Session, voto: Voto) -> bool:
-    """Check if vote already exists in database"""
-    return session.query(Voto).filter(
-        Voto.votacao_id == voto.votacao_id,
-        Voto.deputado_id == voto.deputado_id
-    ).first() is not None
-
-def clear_table(session: Session, model_class) -> None:
-    """Clear all records from a table"""
-    session.query(model_class).delete()
-    session.commit()
-
-def load_deputados(
-    session: Optional[Session] = None, 
-    incremental: bool = True,
-    **api_params
-) -> int:
+@task(name="Load Deputados", retries=3, retry_delay_seconds=30)
+def load_deputados(df_deputados_clean: Optional[pd.DataFrame] = None, df_details_clean: Optional[pd.DataFrame] = None) -> int:
     """
-    Load deputies from API to database.
+    Load deputies data into the database.
     
     Args:
-        session: SQLAlchemy session (optional, will create one if not provided)
-        incremental: If True, only insert new deputies or update existing ones
-        **api_params: Parameters to pass to the API function
+        df_deputados_clean: Processed DataFrame with basic deputies data
+        df_details_clean: Processed DataFrame with detailed deputies data
         
     Returns:
         Number of deputies loaded
     """
-    logger.info("Loading deputies data...")
+    if df_deputados_clean is None:
+        df_deputados_clean = load_dataframe("deputados", processed=True)
     
-    # Create session if not provided
-    session_provided = session is not None
-    if not session_provided:
-        session = SessionLocal()
+    if df_details_clean is None:
+        df_details_clean = load_dataframe("detalhes_deputados", processed=True)
+    
+    if df_deputados_clean is None or df_deputados_clean.empty:
+        logger.warning("No processed deputados data available for loading")
+        return 0
+    
+    logger.info(f"Loading {len(df_deputados_clean)} deputados into database")
+    
+    # Get database session
+    try:
+        db, engine = get_db_session()
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        return 0
+    
+    num_new = 0
+    num_updated = 0
     
     try:
-        # If full load, clear the table first
-        if not incremental:
-            clear_table(session, Deputado)
+        # First, determine which deputies are new (not in the database)
+        existing_ids_query = text("SELECT id FROM deputados")
+        try:
+            existing_ids = {row[0] for row in db.execute(existing_ids_query)}
+        except SQLAlchemyError as e:
+            logger.error(f"Error querying existing deputies: {e}")
+            existing_ids = set()
         
-        # Get deputies list from API
-        deputados_df = obter_deputados(**api_params)
-        if deputados_df is None or deputados_df.empty:
-            logger.warning("No deputies data found.")
-            return 0
+        # Get the list of all IDs from the DataFrame
+        all_ids = set(df_deputados_clean['id'].unique())
         
-        count = 0
-        # Process each deputy to get detailed information
-        for _, row in deputados_df.iterrows():
-            deputado_id = row['id']
-            detalhe = obter_detalhe_deputado(deputado_id)
-            
-            if detalhe and 'dados' in detalhe:
-                deputado_data = detalhe['dados']
-                deputado_model = transform_deputado(deputado_data)
+        # Determine new and existing deputies
+        new_ids = all_ids - existing_ids
+        existing_ids_to_update = all_ids & existing_ids
+        
+        logger.info(f"Found {len(new_ids)} new deputados and {len(existing_ids_to_update)} existing deputados to update")
+        
+        # Process for insertion/update
+        deputados_to_add = []
+        
+        # Add new deputies
+        for _, row in df_deputados_clean[df_deputados_clean['id'].isin(new_ids)].iterrows():
+            try:
+                row_dict = row.to_dict()
                 
-                # Check if deputado already exists (for incremental load)
-                if incremental:
-                    existing = session.query(Deputado).filter(Deputado.id == deputado_id).first()
-                    if existing:
-                        # Update existing record with new data
-                        for key, value in deputado_model.__dict__.items():
-                            if key != '_sa_instance_state':
-                                setattr(existing, key, value)
-                    else:
-                        session.add(deputado_model)
+                # Merge with details if available
+                if df_details_clean is not None and not df_details_clean.empty:
+                    details_row = df_details_clean[df_details_clean['id'] == row_dict['id']]
+                    if not details_row.empty:
+                        # Convert details row to dictionary
+                        details_dict = details_row.iloc[0].to_dict()
+                        # Make sure we have a nomeCivil
+                        if 'nomeCivil' in details_dict and details_dict['nomeCivil']:
+                            row_dict['nomeCivil'] = details_dict['nomeCivil']
+                        else:
+                            # Use nome as fallback for nomeCivil if needed
+                            row_dict['nomeCivil'] = row_dict.get('nome', '')
+                        # Update row_dict with details
+                        row_dict.update({
+                            'sexo': details_dict.get('sexo'),
+                            'dataNascimento': details_dict.get('dataNascimento'),
+                            'ufNascimento': details_dict.get('ufNascimento'),
+                            'municipioNascimento': details_dict.get('municipioNascimento'),
+                        })
                 else:
-                    session.add(deputado_model)
+                    # Make sure we have a nomeCivil even without details
+                    row_dict['nomeCivil'] = row_dict.get('nome', '')
                 
-                count += 1
+                # Transform to SQLAlchemy model
+                deputado = transform_deputado(row_dict)
+                deputados_to_add.append(deputado)
+            except Exception as e:
+                logger.error(f"Error processing deputado {row.get('id', 'unknown')}: {e}")
+        
+        # Update existing deputies
+        for _, row in df_deputados_clean[df_deputados_clean['id'].isin(existing_ids_to_update)].iterrows():
+            try:
+                row_dict = row.to_dict()
                 
-                # Commit every 100 records to avoid large transactions
-                if count % 100 == 0:
-                    session.commit()
-                    logger.info(f"Processed {count} deputies so far...")
+                # Get the existing deputy from the database
+                existing_deputado = db.query(Deputado).filter(Deputado.id == row_dict['id']).first()
+                
+                if existing_deputado:
+                    # Update basic fields
+                    existing_deputado.uri = row_dict.get('uri', existing_deputado.uri)
+                    existing_deputado.ultimo_status_nome = row_dict.get('nome', existing_deputado.ultimo_status_nome)
+                    existing_deputado.ultimo_status_sigla_partido = row_dict.get('siglaPartido', existing_deputado.ultimo_status_sigla_partido)
+                    existing_deputado.ultimo_status_sigla_uf = row_dict.get('siglaUf', existing_deputado.ultimo_status_sigla_uf)
+                    existing_deputado.ultimo_status_id_legislatura = row_dict.get('idLegislatura', existing_deputado.ultimo_status_id_legislatura)
+                    existing_deputado.ultimo_status_url_foto = row_dict.get('urlFoto', existing_deputado.ultimo_status_url_foto)
+                    existing_deputado.ultimo_status_email = row_dict.get('email', existing_deputado.ultimo_status_email)
+                    
+                    # Update with details if available
+                    if df_details_clean is not None and not df_details_clean.empty:
+                        details_row = df_details_clean[df_details_clean['id'] == row_dict['id']]
+                        if not details_row.empty:
+                            details_dict = details_row.iloc[0].to_dict()
+                            if 'nomeCivil' in details_dict and details_dict['nomeCivil']:
+                                existing_deputado.nome_civil = details_dict['nomeCivil']
+                            existing_deputado.sexo = details_dict.get('sexo', existing_deputado.sexo)
+                            existing_deputado.data_nascimento = details_dict.get('dataNascimento', existing_deputado.data_nascimento)
+                            existing_deputado.uf_nascimento = details_dict.get('ufNascimento', existing_deputado.uf_nascimento)
+                            existing_deputado.municipio_nascimento = details_dict.get('municipioNascimento', existing_deputado.municipio_nascimento)
+                            existing_deputado.ultimo_status_condicao_eleitoral = details_dict.get('condicaoEleitoral', existing_deputado.ultimo_status_condicao_eleitoral)
+                            existing_deputado.ultimo_status_situacao = details_dict.get('situacao', existing_deputado.ultimo_status_situacao)
+                            existing_deputado.ultimo_status_data = details_dict.get('dataUltimoStatus', existing_deputado.ultimo_status_data)
+                    
+                    num_updated += 1
+            except Exception as e:
+                logger.error(f"Error updating deputado {row.get('id', 'unknown')}: {e}")
         
-        # Final commit
-        session.commit()
-        logger.info(f"Successfully loaded {count} deputies.")
-        return count
+        # Commit new deputies to database
+        try:
+            num_new = commit_to_db(db, deputados_to_add, "deputados (new)")
+            db.commit()  # Commit updates
+        except IntegrityError as e:
+            db.rollback()
+            logger.error(f"Integrity error loading deputados: {e}")
+            # Try inserting one by one to salvage what we can
+            num_new = 0
+            for deputado in deputados_to_add:
+                try:
+                    db.add(deputado)
+                    db.commit()
+                    num_new += 1
+                except IntegrityError:
+                    db.rollback()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error committing deputados: {e}")
+        
+        return num_new + num_updated
     
     except Exception as e:
-        session.rollback()
-        logger.error(f"Error loading deputies: {str(e)}")
-        raise
-    
+        db.rollback()
+        logger.error(f"Error loading deputados: {e}")
+        return 0
     finally:
-        # Only close if we created the session
-        if not session_provided:
-            session.close()
+        db.close()
+        engine.dispose()
 
-def load_despesas(
-    deputado_id: int,
-    session: Optional[Session] = None,
-    incremental: bool = True,
-    **api_params
-) -> int:
+@task(name="Load Votacoes", retries=3, retry_delay_seconds=30)
+def load_votacoes(df_votacoes_clean: Optional[pd.DataFrame] = None) -> int:
     """
-    Load expenses for a deputy from API to database.
+    Load voting sessions data into the database.
     
     Args:
-        deputado_id: ID of the deputy
-        session: SQLAlchemy session (optional, will create one if not provided)
-        incremental: If True, only insert new expenses
-        **api_params: Parameters to pass to the API function
-        
-    Returns:
-        Number of expenses loaded
-    """
-    logger.info(f"Loading expenses for deputy ID {deputado_id}...")
-    
-    # Create session if not provided
-    session_provided = session is not None
-    if not session_provided:
-        session = SessionLocal()
-    
-    try:
-        # If full load, clear existing expenses for this deputy
-        if not incremental:
-            session.query(Despesa).filter(Despesa.deputado_id == deputado_id).delete()
-            session.commit()
-        
-        # Get expenses from API
-        despesas_df = obter_despesas_deputado(deputado_id, **api_params)
-        if despesas_df is None or despesas_df.empty:
-            logger.warning(f"No expenses found for deputy ID {deputado_id}.")
-            return 0
-        
-        # Transform to model instances
-        despesas_models = transform_dataframe_to_models(
-            despesas_df, 
-            transform_despesa, 
-            deputado_id=deputado_id
-        )
-        
-        # Load to database
-        count = load_data(
-            despesas_models, 
-            session, 
-            incremental,
-            check_despesa_exists if incremental else None
-        )
-        
-        logger.info(f"Successfully loaded {count} expenses for deputy ID {deputado_id}.")
-        return count
-    
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error loading expenses for deputy ID {deputado_id}: {str(e)}")
-        raise
-    
-    finally:
-        # Only close if we created the session
-        if not session_provided:
-            session.close()
-
-def load_discursos(
-    deputado_id: int,
-    session: Optional[Session] = None,
-    incremental: bool = True,
-    **api_params
-) -> int:
-    """
-    Load speeches for a deputy from API to database.
-    
-    Args:
-        deputado_id: ID of the deputy
-        session: SQLAlchemy session (optional, will create one if not provided)
-        incremental: If True, only insert new speeches
-        **api_params: Parameters to pass to the API function
-        
-    Returns:
-        Number of speeches loaded
-    """
-    logger.info(f"Loading speeches for deputy ID {deputado_id}...")
-    
-    # Create session if not provided
-    session_provided = session is not None
-    if not session_provided:
-        session = SessionLocal()
-    
-    try:
-        # If full load, clear existing speeches for this deputy
-        if not incremental:
-            session.query(Discurso).filter(Discurso.deputado_id == deputado_id).delete()
-            session.commit()
-        
-        # Get speeches from API
-        discursos_df = obter_discursos_deputado(deputado_id, **api_params)
-        if discursos_df is None or discursos_df.empty:
-            logger.warning(f"No speeches found for deputy ID {deputado_id}.")
-            return 0
-        
-        # Transform to model instances
-        discursos_models = transform_dataframe_to_models(
-            discursos_df, 
-            transform_discurso, 
-            deputado_id=deputado_id
-        )
-        
-        # Load to database
-        count = load_data(
-            discursos_models, 
-            session, 
-            incremental,
-            check_discurso_exists if incremental else None
-        )
-        
-        logger.info(f"Successfully loaded {count} speeches for deputy ID {deputado_id}.")
-        return count
-    
-    except Exception as e:
-        session.rollback()
-        logger.error(f"Error loading speeches for deputy ID {deputado_id}: {str(e)}")
-        raise
-    
-    finally:
-        # Only close if we created the session
-        if not session_provided:
-            session.close()
-
-def load_votacoes(
-    session: Optional[Session] = None,
-    incremental: bool = True,
-    **api_params
-) -> int:
-    """
-    Load voting sessions from API to database.
-    
-    Args:
-        session: SQLAlchemy session (optional, will create one if not provided)
-        incremental: If True, only insert new voting sessions
-        **api_params: Parameters to pass to the API function
+        df_votacoes_clean: Processed DataFrame with voting sessions data
         
     Returns:
         Number of voting sessions loaded
     """
-    logger.info("Loading voting sessions data...")
+    if df_votacoes_clean is None:
+        df_votacoes_clean = load_dataframe("votacoes", processed=True)
     
-    # Create session if not provided
-    session_provided = session is not None
-    if not session_provided:
-        session = SessionLocal()
+    if df_votacoes_clean is None or df_votacoes_clean.empty:
+        logger.warning("No processed votacoes data available for loading")
+        return 0
+    
+    logger.info(f"Loading {len(df_votacoes_clean)} votacoes into database")
+    
+    # Get database session
+    try:
+        db, engine = get_db_session()
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        return 0
+    
+    num_new = 0
+    num_updated = 0
     
     try:
-        # If full load, clear the table first
-        if not incremental:
-            clear_table(session, Votacao)
+        # First, determine which voting sessions are new (not in the database)
+        existing_ids_query = text("SELECT id FROM votacoes")
+        try:
+            existing_ids = {row[0] for row in db.execute(existing_ids_query)}
+        except SQLAlchemyError as e:
+            logger.error(f"Error querying existing votacoes: {e}")
+            existing_ids = set()
         
-        # Get voting sessions from API
-        votacoes_df = obter_votacoes(**api_params)
-        if votacoes_df is None or votacoes_df.empty:
-            logger.warning("No voting sessions found.")
-            return 0
+        # Get the list of all IDs from the DataFrame - ensure they're strings
+        all_ids = set(df_votacoes_clean['id'].astype(str).unique())
         
-        # Transform to model instances
-        votacoes_models = transform_dataframe_to_models(
-            votacoes_df, 
-            transform_votacao
-        )
+        # Determine new and existing voting sessions
+        new_ids = all_ids - existing_ids
+        existing_ids_to_update = all_ids & existing_ids
         
-        # Load to database
-        count = load_data(
-            votacoes_models, 
-            session, 
-            incremental,
-            check_votacao_exists if incremental else None
-        )
+        logger.info(f"Found {len(new_ids)} new votacoes and {len(existing_ids_to_update)} existing votacoes to update")
         
-        logger.info(f"Successfully loaded {count} voting sessions.")
-        return count
+        # Process for insertion/update
+        votacoes_to_add = []
+        
+        # Add new voting sessions
+        for _, row in df_votacoes_clean[df_votacoes_clean['id'].astype(str).isin(new_ids)].iterrows():
+            try:
+                row_dict = row.to_dict()
+                # Ensure id is a string
+                row_dict['id'] = str(row_dict['id'])
+                votacao = transform_votacao(row_dict)
+                votacoes_to_add.append(votacao)
+            except Exception as e:
+                logger.error(f"Error processing votacao {row.get('id', 'unknown')}: {e}")
+        
+        # Update existing voting sessions
+        for _, row in df_votacoes_clean[df_votacoes_clean['id'].astype(str).isin(existing_ids_to_update)].iterrows():
+            try:
+                row_dict = row.to_dict()
+                # Ensure id is a string
+                row_id = str(row_dict['id'])
+                
+                # Get the existing voting session from the database
+                existing_votacao = db.query(Votacao).filter(Votacao.id == row_id).first()
+                
+                if existing_votacao:
+                    # Update fields
+                    existing_votacao.uri = row_dict.get('uri', existing_votacao.uri)
+                    existing_votacao.data = row_dict.get('data', existing_votacao.data)
+                    existing_votacao.data_hora_registro = row_dict.get('dataHoraRegistro', existing_votacao.data_hora_registro)
+                    existing_votacao.sigla_orgao = row_dict.get('siglaOrgao', existing_votacao.sigla_orgao)
+                    existing_votacao.uri_orgao = row_dict.get('uriOrgao', existing_votacao.uri_orgao)
+                    existing_votacao.proposicao_objeto = row_dict.get('proposicaoObjeto', existing_votacao.proposicao_objeto)
+                    existing_votacao.tipo_votacao = row_dict.get('tipoVotacao', existing_votacao.tipo_votacao)
+                    existing_votacao.ultima_apresentacao_proposicao = row_dict.get('ultimaApresentacaoProposicao', existing_votacao.ultima_apresentacao_proposicao)
+                    existing_votacao.aprovacao = row_dict.get('aprovacao', existing_votacao.aprovacao)
+                    num_updated += 1
+            except Exception as e:
+                logger.error(f"Error updating votacao {row.get('id', 'unknown')}: {e}")
+        
+        # Commit new voting sessions to database
+        try:
+            num_new = commit_to_db(db, votacoes_to_add, "votacoes (new)")
+            db.commit()  # Commit updates
+        except IntegrityError as e:
+            db.rollback()
+            logger.error(f"Integrity error loading votacoes: {e}")
+            # Try inserting one by one to salvage what we can
+            num_new = 0
+            for votacao in votacoes_to_add:
+                try:
+                    db.add(votacao)
+                    db.commit()
+                    num_new += 1
+                except IntegrityError:
+                    db.rollback()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error committing votacoes: {e}")
+        
+        return num_new + num_updated
     
     except Exception as e:
-        session.rollback()
-        logger.error(f"Error loading voting sessions: {str(e)}")
-        raise
-    
+        db.rollback()
+        logger.error(f"Error loading votacoes: {e}")
+        return 0
     finally:
-        # Only close if we created the session
-        if not session_provided:
-            session.close()
+        db.close()
+        engine.dispose()
 
-def load_votos(
-    votacao_id: str,
-    session: Optional[Session] = None,
-    incremental: bool = True
-) -> int:
+@task(name="Load Votos", retries=3, retry_delay_seconds=30)
+def load_votos(df_votos_clean: Optional[pd.DataFrame] = None) -> int:
     """
-    Load votes for a voting session from API to database.
+    Load votes data into the database.
     
     Args:
-        votacao_id: ID of the voting session
-        session: SQLAlchemy session (optional, will create one if not provided)
-        incremental: If True, only insert new votes
+        df_votos_clean: Processed DataFrame with votes data
         
     Returns:
         Number of votes loaded
     """
-    logger.info(f"Loading votes for voting session ID {votacao_id}...")
+    if df_votos_clean is None:
+        df_votos_clean = load_dataframe("votos", processed=True)
     
-    # Create session if not provided
-    session_provided = session is not None
-    if not session_provided:
-        session = SessionLocal()
+    if df_votos_clean is None or df_votos_clean.empty:
+        logger.warning("No processed votos data available for loading")
+        return 0
+    
+    logger.info(f"Loading {len(df_votos_clean)} votos into database")
+    
+    # Get database session
+    try:
+        db, engine = get_db_session()
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        return 0
     
     try:
-        # If full load, clear existing votes for this voting session
-        if not incremental:
-            session.query(Voto).filter(Voto.votacao_id == votacao_id).delete()
-            session.commit()
+        # Check if we have the necessary foreign keys in the database
+        votacao_ids = set(df_votos_clean['idVotacao'].astype(str).unique())
         
-        # Get votes from API
-        votos_df = obter_votos_votacao(votacao_id)
-        if votos_df is None or votos_df.empty:
-            logger.warning(f"No votes found for voting session ID {votacao_id}.")
+        # Filter out rows with missing or invalid deputado IDs
+        df_votos_clean = df_votos_clean.dropna(subset=['deputadoId'])
+        try:
+            df_votos_clean['deputadoId'] = df_votos_clean['deputadoId'].astype(int)
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error converting deputadoId to int: {e}")
+            # Try to salvage valid IDs
+            valid_ids = []
+            for idx, row in df_votos_clean.iterrows():
+                try:
+                    row['deputadoId'] = int(row['deputadoId'])
+                    valid_ids.append(idx)
+                except (ValueError, TypeError):
+                    pass
+            df_votos_clean = df_votos_clean.loc[valid_ids]
+        
+        if df_votos_clean.empty:
+            logger.warning("No valid votos data after filtering for valid deputado IDs")
             return 0
         
-        # Transform to model instances
-        votos_models = transform_dataframe_to_models(
-            votos_df, 
-            transform_voto, 
-            votacao_id=votacao_id
+        deputado_ids = set(df_votos_clean['deputadoId'].astype(int).unique())
+        
+        # Verify votacao_ids exist in database
+        db_votacao_ids_query = text("SELECT id FROM votacoes")
+        try:
+            db_votacao_ids = {str(row[0]) for row in db.execute(db_votacao_ids_query)}
+        except SQLAlchemyError as e:
+            logger.error(f"Error querying votacao IDs: {e}")
+            db_votacao_ids = set()
+        
+        missing_votacao_ids = votacao_ids - db_votacao_ids
+        
+        # Verify deputado_ids exist in database
+        db_deputado_ids_query = text("SELECT id FROM deputados")
+        try:
+            db_deputado_ids = {row[0] for row in db.execute(db_deputado_ids_query)}
+        except SQLAlchemyError as e:
+            logger.error(f"Error querying deputado IDs: {e}")
+            db_deputado_ids = set()
+        
+        missing_deputado_ids = deputado_ids - db_deputado_ids
+        
+        if missing_votacao_ids:
+            logger.warning(f"Found {len(missing_votacao_ids)} votacao IDs not in the database")
+        
+        if missing_deputado_ids:
+            logger.warning(f"Found {len(missing_deputado_ids)} deputado IDs not in the database")
+        
+        # Filter out votes with missing foreign keys
+        valid_df = df_votos_clean[
+            (df_votos_clean['idVotacao'].astype(str).isin(db_votacao_ids)) & 
+            (df_votos_clean['deputadoId'].astype(int).isin(db_deputado_ids))
+        ]
+        
+        if valid_df.empty:
+            logger.warning("No valid votos to load after filtering for existing foreign keys")
+            return 0
+        
+        logger.info(f"Loading {len(valid_df)} valid votos after filtering")
+        
+        # Find existing votes to avoid duplicates
+        # Create a composite key of votacao_id and deputado_id for comparison
+        valid_df['composite_key'] = valid_df.apply(
+            lambda row: f"{row['idVotacao']}_{row['deputadoId']}", 
+            axis=1
         )
         
-        # Load to database
-        count = load_data(
-            votos_models, 
-            session, 
-            incremental,
-            check_voto_exists if incremental else None
-        )
+        # Query for existing composite keys
+        try:
+            existing_votos_query = text("""
+                SELECT CONCAT(votacao_id, '_', deputado_id) as composite_key
+                FROM votos
+            """)
+            existing_keys = {row[0] for row in db.execute(existing_votos_query)}
+        except SQLAlchemyError as e:
+            logger.error(f"Error querying existing votos: {e}")
+            existing_keys = set()
         
-        logger.info(f"Successfully loaded {count} votes for voting session ID {votacao_id}.")
-        return count
+        # Filter for new votes only
+        new_df = valid_df[~valid_df['composite_key'].isin(existing_keys)]
+        
+        logger.info(f"Found {len(new_df)} new votos to add")
+        
+        # Transform and add new votes
+        votos_to_add = []
+        for _, row in new_df.iterrows():
+            try:
+                row_dict = {
+                    'votacao_id': row['idVotacao'],
+                    'deputado_id': int(row['deputadoId']),
+                    'data_registro_voto': row['dataRegistroVoto'],
+                    'tipo_voto': row['tipoVoto']
+                }
+                voto = transform_voto(row_dict, str(row['idVotacao']))
+                votos_to_add.append(voto)
+            except Exception as e:
+                logger.error(f"Error processing voto for votacao {row.get('idVotacao', 'unknown')}, deputado {row.get('deputadoId', 'unknown')}: {e}")
+        
+        # Commit new votes to database
+        try:
+            num_added = commit_to_db(db, votos_to_add, "votos")
+            return num_added
+        except IntegrityError as e:
+            db.rollback()
+            logger.error(f"Integrity error loading votos: {e}")
+            # Try inserting one by one to salvage what we can
+            num_added = 0
+            for voto in votos_to_add:
+                try:
+                    db.add(voto)
+                    db.commit()
+                    num_added += 1
+                except IntegrityError:
+                    db.rollback()
+            return num_added
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error committing votos: {e}")
+            return 0
     
     except Exception as e:
-        session.rollback()
-        logger.error(f"Error loading votes for voting session ID {votacao_id}: {str(e)}")
-        raise
-    
+        db.rollback()
+        logger.error(f"Error loading votos: {e}")
+        return 0
     finally:
-        # Only close if we created the session
-        if not session_provided:
-            session.close()
-
-def run_full_etl(incremental: bool = True, **api_params) -> Dict[str, int]:
-    """
-    Run full ETL process for all data types.
-    
-    Args:
-        incremental: If True, use incremental loading, else full loading
-        **api_params: Parameters to pass to the API functions
-        
-    Returns:
-        Dictionary with counts of records loaded for each entity
-    """
-    logger.info(f"Starting {'incremental' if incremental else 'full'} ETL process...")
-    
-    session = SessionLocal()
-    try:
-        results = {}
-        
-        # Load deputies
-        results['deputados'] = load_deputados(session, incremental, **api_params)
-        
-        # Get list of deputy IDs
-        deputados_ids = [id for (id,) in session.query(Deputado.id).all()]
-        
-        # Load expenses for each deputy
-        despesas_count = 0
-        for deputado_id in deputados_ids:
-            despesas_count += load_despesas(deputado_id, session, incremental, **api_params)
-        results['despesas'] = despesas_count
-        
-        # Load speeches for each deputy
-        discursos_count = 0
-        for deputado_id in deputados_ids:
-            discursos_count += load_discursos(deputado_id, session, incremental, **api_params)
-        results['discursos'] = discursos_count
-        
-        # Load voting sessions
-        results['votacoes'] = load_votacoes(session, incremental, **api_params)
-        
-        # Get list of voting session IDs
-        votacoes_ids = [id for (id,) in session.query(Votacao.id).all()]
-        
-        # Load votes for each voting session
-        votos_count = 0
-        for votacao_id in votacoes_ids:
-            votos_count += load_votos(votacao_id, session, incremental)
-        results['votos'] = votos_count
-        
-        logger.info(f"ETL process completed successfully.")
-        logger.info(f"Summary: {results}")
-        return results
-    
-    except Exception as e:
-        logger.error(f"Error in ETL process: {str(e)}")
-        raise
-    
-    finally:
-        session.close()
+        db.close()
+        engine.dispose()

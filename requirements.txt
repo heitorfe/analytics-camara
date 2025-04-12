@@ -2,5 +2,10 @@ pandas
 numpy
 pydantic
 sqlalchemy
-psycopg2
-streamlit
+psycopg2-binary
+prefect>=2.0.0
+python-dotenv
+pyarrow
+fastparquet
+requests
+tqdm

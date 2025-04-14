@@ -1,0 +1,11 @@
+# This file is no longer used as we've moved to a Python-based scheduler (app/scheduler.py)
+# Keeping as reference only:
+#
+# Execute o pipeline incremental para todos os dados a cada hora
+# 0 * * * * cd /app && python -m app.ingestion.cron_etl --mode incremental --entity all >> /app/etl_cron_hourly.log 2>&1
+#
+# Execute o pipeline completo (full) para deputados uma vez por dia às 2:00 AM
+# 0 2 * * * cd /app && python -m app.ingestion.cron_etl --mode full --entity deputados >> /app/etl_cron_deputados_full.log 2>&1
+#
+# Execute o pipeline completo (full) para todas as entidades uma vez por semana no domingo às 3:00 AM
+# 0 3 * * 0 cd /app && python -m app.ingestion.cron_etl --mode full --entity all >> /app/etl_cron_full.log 2>&1

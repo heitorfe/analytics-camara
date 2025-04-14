@@ -5,16 +5,12 @@ set -e
 mkdir -p /app/data/raw
 mkdir -p /app/data/processed
 mkdir -p /app/logs
+touch /app/logs/etl.log
 
 # If DATABASE_URL is not set, use default
 if [ -z "$DATABASE_URL" ]; then
   export DATABASE_URL="postgresql://postgres:postgres@db:5432/camara_analytics"
 fi
-
-# Set up cron job
-echo "Setting up cron jobs..."
-crontab /app/crontab
-service cron start
 
 # Initialize the database if requested
 if [ "$1" = "init-db" ]; then
@@ -29,6 +25,10 @@ elif [ "$1" = "etl" ]; then
   ARGS="${@:2}"
   echo "Running ETL process with arguments: $ARGS"
   python -m app.ingestion.cron_etl $ARGS
+else
+  # Start the Python scheduler instead of cron
+  echo "Starting Python scheduler..."
+  python -m app.scheduler &
 fi
 
 # Keep container running

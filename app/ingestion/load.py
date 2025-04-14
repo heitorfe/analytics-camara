@@ -6,13 +6,14 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 
-from app.database.models import Deputado, Votacao, Voto
+from app.database.models import Deputado, Votacao, Voto, Discurso
 from app.config import DATABASE_URL
 from app.ingestion.utils import load_dataframe, commit_to_db
 from app.ingestion.transform import (
     transform_deputado,
     transform_votacao,
-    transform_voto
+    transform_voto,
+    transform_discurso
 )
 
 logger = logging.getLogger(__name__)
@@ -464,3 +465,114 @@ def load_votos(df_votos_clean: Optional[pd.DataFrame] = None) -> int:
     finally:
         db.close()
         engine.dispose()
+
+@task(name="Load Discursos", retries=3, retry_delay_seconds=30)
+def load_discursos(df_discursos_clean: Optional[pd.DataFrame] = None) -> int:
+    """
+    Load speeches data into the database.
+
+    Args:
+        df_discursos_clean: Processed DataFrame with speeches data
+    Returns:
+        Number of speeches loaded
+    """
+
+    if df_discursos_clean is None:
+        df_discursos_clean = load_dataframe("discursos", processed=True)
+
+    if df_discursos_clean is None or df_discursos_clean.empty:
+        logger.warning("No processed discursos data available for loading")
+        return 0
+    
+    logger.info(f"Loading {len(df_discursos_clean)} discursos into database")
+
+    # Get database session
+    try:
+        db, engine = get_db_session()
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        return 0
+    
+    num_new = 0
+    num_updated = 0
+
+    try:
+        # First, determine which speeches are new (not in the database)
+        existing_ids_query = text("SELECT id FROM discursos")
+        try:
+            existing_ids = {row[0] for row in db.execute(existing_ids_query)}
+        except SQLAlchemyError as e:
+            logger.error(f"Error querying existing discursos: {e}")
+            existing_ids = set()
+
+        # Get the list of all IDs from the DataFrame
+        all_ids = set(df_discursos_clean['id'].unique())
+
+        # Determine new and existing speeches
+        new_ids = all_ids - existing_ids
+        existing_ids_to_update = all_ids & existing_ids
+
+        logger.info(f"Found {len(new_ids)} new discursos and {len(existing_ids_to_update)} existing discursos to update")
+
+        # Process for insertion/update
+        discursos_to_add = []
+        # Add new speeches
+        for _, row in df_discursos_clean[df_discursos_clean['id'].isin(new_ids)].iterrows():
+            try:
+                row_dict = row.to_dict()
+                # Transform to SQLAlchemy model
+                discurso = transform_discurso(row_dict)
+                discursos_to_add.append(discurso)
+            except Exception as e:
+                logger.error(f"Error processing discurso {row.get('id', 'unknown')}: {e}")
+
+        # Update existing speeches
+        for _, row in df_discursos_clean[df_discursos_clean['id'].isin(existing_ids_to_update)].iterrows():
+            try:
+                row_dict = row.to_dict()
+                # Get the existing speech from the database
+                existing_discurso = db.query(Discurso).filter(Discurso.id == row_dict['id']).first()
+
+                if existing_discurso:
+                    # Update fields
+                    existing_discurso.uri = row_dict.get('uri', existing_discurso.uri)
+                    existing_discurso.data = row_dict.get('data', existing_discurso.data)
+                    existing_discurso.id_deputado = row_dict.get('idDeputado', existing_discurso.id_deputado)
+                    existing_discurso.id_votacao = row_dict.get('idVotacao', existing_discurso.id_votacao)
+                    num_updated += 1
+            except Exception as e:
+                logger.error(f"Error updating discurso {row.get('id', 'unknown')}: {e}")
+        # Commit new speeches to database
+        try:
+            num_new = commit_to_db(db, discursos_to_add, "discursos (new)")
+            db.commit()  # Commit updates
+
+        except IntegrityError as e:
+            db.rollback()
+            logger.error(f"Integrity error loading discursos: {e}")
+            # Try inserting one by one to salvage what we can
+            num_new = 0
+            for discurso in discursos_to_add:
+                try:
+                    db.add(discurso)
+                    db.commit()
+                    num_new += 1
+                except IntegrityError:
+                    db.rollback()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error committing discursos: {e}")
+
+        return num_new + num_updated
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error loading discursos: {e}")
+        return 0
+    finally:
+        db.close()
+        engine.dispose()
+
+
+    
+

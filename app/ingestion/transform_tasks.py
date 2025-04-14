@@ -323,3 +323,67 @@ def transform_votos(df_votos: Optional[pd.DataFrame] = None) -> pd.DataFrame:
             return minimal_df
         except:
             return None
+        
+@task(name="Transform Discursos")
+def transform_discursos(df_discursos: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Transform speeches data.
+
+    Args:
+        df_discursos: Raw DataFrame with speeches data
+
+    Returns:
+        Transformed DataFrame
+    """
+    if df_discursos is None:
+        df_discursos = load_dataframe("discursos")
+
+    if df_discursos is None or df_discursos.empty:
+        logger.warning("No discursos data available for transformation")
+        return None
+    
+    logger.info(f"Transforming {len(df_discursos)} discursos")
+
+    try:
+        df_clean = pd.DataFrame()
+
+        # Check for required ID column
+        required_columns = {
+            'id': ['id'],
+            'deputado_id': ['deputado_id', 'deputadoId'],
+            'data_hora_inicio': ['dataHoraInicio', 'data_hora_inicio'],
+            'data_hora_fim': ['dataHoraFim', 'data_hora_fim'],
+            'fase_evento': ['faseEvento', 'fase_evento'],
+            'tipo_discurso': ['tipoDiscurso', 'tipo_discurso'],
+            'url_texto': ['urlTexto', 'url_texto'],
+            'url_audio': ['urlAudio', 'url_audio'],
+            'url_video': ['urlVideo', 'url_video'],
+            'keywords': ['keywords'],
+            'sumario': ['sumario'],
+            'transcricao': ['transcricao']
+        }
+
+
+        # Try to add each required column
+        for col, possible_names in required_columns.items():
+            for name in possible_names:
+                if name in df_discursos.columns:
+                    df_clean[col] = df_discursos[name]
+                    break
+                else:
+                    df_clean[col] = None
+
+        # Convert data types safely
+        df_clean = df_clean.convert_dtypes()
+
+        # Save processed data
+        save_dataframe(df_clean, "discursos", processed=True)
+
+        return df_clean
+    
+    except Exception as e:
+        logger.error(f"Error transforming discursos: {e}", exc_info=True)
+        # Return a minimal dataframe with just the IDs if possible
+        if 'id' in df_discursos.columns:
+            return pd.DataFrame({'id': df_discursos['id']})
+        return None

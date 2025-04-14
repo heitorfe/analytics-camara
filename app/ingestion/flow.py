@@ -8,18 +8,21 @@ from app.ingestion.extract import (
     extract_deputados,
     extract_deputados_details,
     extract_votacoes,
-    extract_votos
+    extract_votos,
+    extract_discursos
 )
 from app.ingestion.transform_tasks import (
     transform_deputados,
     transform_deputados_details,
     transform_votacoes,
-    transform_votos
+    transform_votos,
+    transform_discursos
 )
 from app.ingestion.load import (
     load_deputados,
     load_votacoes,
-    load_votos
+    load_votos,
+    load_discursos
 )
 from app.config import YESTERDAY, TODAY
 
@@ -140,6 +143,41 @@ def votos_etl_flow(mode: str = "full", df_votacoes: Optional[Any] = None) -> Dic
     logger.info(f"Votos ETL flow completed with stats: {stats}")
     return stats
 
+@flow(name="Discursos ETL Flow")
+def discursos_etl_flow(mode: str = "full", df_deputados: Optional[Any] = None) -> Dict[str, int]:
+    """
+    Flow for extracting, transforming, and loading speeches data.
+    
+    Args:
+        mode: 'full' for full extraction, 'incremental' for incremental
+        df_deputados: DataFrame with deputies from previous task
+        
+    Returns:
+        Statistics about the ETL process
+    """
+    logger = get_run_logger()
+    logger.info(f"Starting discursos ETL flow in {mode} mode")
+    
+    # Extract
+    logger.info("Starting extraction phase for discursos")
+    df_discursos = extract_discursos(df_deputados=df_deputados, mode=mode)
+    
+    # Transform
+    logger.info("Starting transformation phase for discursos")
+    df_discursos_clean = transform_discursos(df_discursos=df_discursos)
+    
+    # Load
+    logger.info("Starting loading phase for discursos")
+    num_loaded = load_discursos(df_discursos_clean=df_discursos_clean)
+    
+    stats = {
+        "discursos_extracted": len(df_discursos) if df_discursos is not None else 0,
+        "discursos_loaded": num_loaded
+    }
+    
+    logger.info(f"Discursos ETL flow completed with stats: {stats}")
+    return stats
+
 @flow(name="Camara Analytics ETL Flow")
 def camara_analytics_etl_flow(
     mode: str = "full",
@@ -160,10 +198,10 @@ def camara_analytics_etl_flow(
         Combined statistics from all flows
     """
     if entities is None:
-        entities = ["deputados", "votacoes", "votos"]
+        entities = ["deputados", "votacoes", "votos", "discursos"]
     elif isinstance(entities, str):
         if entities.lower() == "all":
-            entities = ["deputados", "votacoes", "votos"] 
+            entities = ["deputados", "votacoes", "votos", "discursos"] 
         else:
             entities = [entities]
     
@@ -186,6 +224,11 @@ def camara_analytics_etl_flow(
         df_votacoes = None if "votacoes" not in entities else extract_votacoes.fn(mode=mode, data_inicio=data_inicio, data_fim=data_fim)
         stats["votos"] = votos_etl_flow(mode=mode, df_votacoes=df_votacoes)
     
+    if "discursos" in entities:
+        # If we processed deputados, we can pass the DataFrame directly
+        df_deputados = None if "deputados" not in entities else extract_deputados.fn(mode=mode)
+        stats["discursos"] = discursos_etl_flow(mode=mode, df_deputados=df_deputados)
+
     logger.info(f"Camara Analytics ETL flow completed with stats: {stats}")
     return stats
 

@@ -25,7 +25,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Camara Analytics ETL process")
     parser.add_argument("--mode", type=str, choices=["full", "incremental"], default="incremental",
                         help="ETL mode (full or incremental)")
-    parser.add_argument("--entity", type=str, default="all",
+    parser.add_argument("--entity", type=str, default="all", choices= ["deputados", "votacoes", "votos", "discursos", "all"],
                         help="Entity to process (deputados, votacoes, votos, or all)")
     parser.add_argument("--start-date", type=str, default=None,
                         help="Start date for extraction (YYYY-MM-DD)")

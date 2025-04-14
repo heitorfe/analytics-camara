@@ -9,7 +9,8 @@ from app.ingestion.api import (
     obter_deputados, 
     obter_detalhe_deputado, 
     obter_votacoes, 
-    obter_votos_votacao
+    obter_votos_votacao,
+    obter_discursos_deputado
 )
 from app.ingestion.utils import (
     save_dataframe, 
@@ -219,3 +220,62 @@ def extract_votos(df_votacoes: Optional[pd.DataFrame] = None, mode: str = "full"
     update_last_update_date("votos")
     
     return df_votos
+
+
+@task(name="Extract Discursos")
+def extract_discursos(df_deputados : Optional[pd.DataFrame] = None, mode: str = "full" ) -> pd.DataFrame:
+    """
+    Extract speeches for each deputy.
+
+    Args:
+        df_deputados: DataFrame with deputies
+        mode: 'full' for all deputados, 'incremental' for recent deputados
+    Returns:
+        DataFrame with speeches data
+    """
+    if df_deputados is None:
+        # Try to load from disk if not provided
+        df_deputados = load_dataframe("deputados")
+
+    if df_deputados is None or df_deputados.empty:
+        logger.warning("No deputados data available for extracting speeches")
+        return None
+    
+    # For incremental mode, filter to recent deputados
+    if mode == "incremental":
+        last_update = get_last_update_date("discursos")
+        if last_update:
+            last_update_dt = datetime.strptime(last_update, '%Y-%m-%d')
+            df_deputados = df_deputados[pd.to_datetime(df_deputados['data']).dt.date >= last_update_dt.date()]
+
+    deputados_ids = df_deputados['id'].unique().tolist()
+    logger.info(f"Extracting discursos for {len(deputados_ids)} deputados")
+
+    all_discursos = []
+
+    for discurso_id in tqdm(deputados_ids, desc="Extracting discursos"):
+        discursos = obter_discursos_deputado(id=discurso_id)
+
+        if discursos is not None and not discursos.empty:
+            discursos['idDeputado'] = discurso_id
+            all_discursos.append(discursos)
+        else:
+            logger.warning(f"No discursos found for deputado {discurso_id}")
+
+
+    if not all_discursos:
+        logger.warning("No discursos data found")
+        return None
+    
+    # Concatenate all speeches
+    df_discursos = pd.concat(all_discursos, ignore_index=True)
+
+    # Save raw data to disk
+    save_dataframe(df_discursos, "discursos")
+
+    # Update last update date
+    update_last_update_date("discursos")
+
+    return df_discursos
+
+

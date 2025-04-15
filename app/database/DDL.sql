@@ -12,6 +12,7 @@ CREATE TABLE deputados (
     data_falecimento DATE,
     uf_nascimento VARCHAR,
     municipio_nascimento VARCHAR,
+    escolaridade VARCHAR,
     ultimo_status_id INTEGER,
     ultimo_status_nome VARCHAR,
     ultimo_status_sigla_partido VARCHAR,

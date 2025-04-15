@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 from .database import engine, SessionLocal
 from .models import Base
 from app.ingestion.extract import extract_deputados, extract_deputados_details, extract_votacoes, extract_votos
-from app.ingestion.transform_tasks import transform_deputados, transform_deputados_details, transform_votacoes, transform_votos
+from app.ingestion.transform import transform_deputados, transform_deputados_details, transform_votacoes, transform_votos
 from app.ingestion.load import load_deputados, load_votacoes, load_votos
 
 logger = logging.getLogger(__name__)

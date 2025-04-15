@@ -2,16 +2,10 @@ import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 import pandas as pd
+import requests
 from prefect import task
 from tqdm import tqdm
 
-from app.ingestion.api import (
-    obter_deputados, 
-    obter_detalhe_deputado, 
-    obter_votacoes, 
-    obter_votos_votacao,
-    obter_discursos_deputado
-)
 from app.ingestion.utils import (
     save_dataframe, 
     load_dataframe, 
@@ -22,60 +16,68 @@ from app.config import YESTERDAY, TODAY
 
 logger = logging.getLogger(__name__)
 
+# -- Funções de API incorporadas --
+
+def fazer_requisicao(url, parametros=None, returnar_df=True):
+    """
+    Realiza uma requisição HTTP para a API da Câmara dos Deputados.
+    
+    Args:
+        url: URL da API
+        parametros: Parâmetros da requisição
+        returnar_df: Se True, retorna um DataFrame, senão retorna o JSON original
+        
+    Returns:
+        DataFrame ou dict com os dados da API, ou None se a requisição falhar
+    """
+    resposta = requests.get(url, params=parametros)
+    if resposta.status_code == 200:
+        dados = resposta.json()
+        if returnar_df and 'dados' in dados and type(dados['dados']) == list: 
+            return pd.DataFrame(dados['dados'])
+        else:
+           return dados
+        
+    return None
+
+# -- Funções de extração --
+
 @task(name="Extract Deputados")
 def extract_deputados(mode: str = "full") -> pd.DataFrame:
     """
-    Extract deputies data from the API.
+    Extrai dados de deputados da API da Câmara e já inclui os detalhes de cada deputado.
+    Consolida as antigas funções extract_deputados e extract_deputados_details.
     
     Args:
-        mode: 'full' for full extraction, 'incremental' for incremental
+        mode: 'full' para extração completa, 'incremental' para incremental
         
     Returns:
-        DataFrame with deputies data
+        DataFrame com dados detalhados dos deputados
     """
-    logger.info(f"Extracting deputados in {mode} mode")
+    logger.info(f"Extracting deputados with details in {mode} mode")
     
-    # For deputies, we always do a full extraction as there's no date filter in the API
-    df_deputados = obter_deputados()
+    # 1. Primeiro obtém a lista básica de deputados
+    url = 'https://dadosabertos.camara.leg.br/api/v2/deputados'
+    df_deputados_basico = fazer_requisicao(url)
     
-    if df_deputados is None or df_deputados.empty:
+    if df_deputados_basico is None or df_deputados_basico.empty:
         logger.warning("No deputados data found")
         return None
     
-    # Save raw data to disk
-    save_dataframe(df_deputados, "deputados")
-    
-    # Update last update date
+    # Salva os dados básicos
+    save_dataframe(df_deputados_basico, "deputados")
     update_last_update_date("deputados")
     
-    return df_deputados
-
-@task(name="Extract Deputados Details")
-def extract_deputados_details(df_deputados: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """
-    Extract detailed information for each deputy.
-    
-    Args:
-        df_deputados: DataFrame with basic deputy information
-        
-    Returns:
-        DataFrame with detailed deputy information
-    """
-    if df_deputados is None:
-        # Try to load from disk if not provided
-        df_deputados = load_dataframe("deputados")
-    
-    if df_deputados is None or df_deputados.empty:
-        logger.warning("No deputados data available for extracting details")
-        return None
-    
+    # 2. Agora obtém os detalhes de cada deputado
     deputados_details = []
-    ids = df_deputados['id'].tolist()
+    ids = df_deputados_basico['id'].tolist()
     
     logger.info(f"Extracting details for {len(ids)} deputados")
     
     for id in tqdm(ids, desc="Extracting deputados details"):
-        detalhe = obter_detalhe_deputado(id)
+        url = f'https://dadosabertos.camara.leg.br/api/v2/deputados/{id}'
+        detalhe = fazer_requisicao(url, returnar_df=False)
+        
         if detalhe and 'dados' in detalhe:
             deputados_details.append(detalhe['dados'])
         else:
@@ -87,10 +89,8 @@ def extract_deputados_details(df_deputados: Optional[pd.DataFrame] = None) -> pd
     
     df_details = pd.DataFrame(deputados_details)
     
-    # Save raw data to disk
+    # Salva os dados detalhados
     save_dataframe(df_details, "detalhes_deputados")
-    
-    # Update last update date
     update_last_update_date("detalhes_deputados")
     
     return df_details
@@ -98,38 +98,38 @@ def extract_deputados_details(df_deputados: Optional[pd.DataFrame] = None) -> pd
 @task(name="Extract Votacoes")
 def extract_votacoes(mode: str = "full", data_inicio: Optional[str] = None, data_fim: Optional[str] = None) -> pd.DataFrame:
     """
-    Extract voting sessions data from the API.
+    Extrai dados de votações da API da Câmara.
     
     Args:
-        mode: 'full' for full extraction, 'incremental' for incremental
-        data_inicio: Start date for extraction (format: YYYY-MM-DD)
-        data_fim: End date for extraction (format: YYYY-MM-DD)
+        mode: 'full' para extração completa, 'incremental' para incremental
+        data_inicio: Data de início para extração (formato: YYYY-MM-DD)
+        data_fim: Data de fim para extração (formato: YYYY-MM-DD)
         
     Returns:
-        DataFrame with voting sessions data
+        DataFrame com dados das votações
     """
     if mode == "incremental":
-        # For incremental, use last update date or yesterday as data_inicio
+        # Para incremental, usa a última data de atualização ou ontem como data_inicio
         if data_inicio is None:
             data_inicio = get_last_update_date("votacoes") or YESTERDAY
         
-        # For incremental, use today as data_fim if not provided
+        # Para incremental, usa hoje como data_fim se não for informado
         if data_fim is None:
             data_fim = TODAY
     
     logger.info(f"Extracting votacoes in {mode} mode from {data_inicio} to {data_fim}")
     
-    # Generate monthly intervals to avoid API limitations
+    # Gera intervalos mensais para evitar limitações da API
     data_inicio_dt = datetime.strptime(data_inicio, '%Y-%m-%d') if data_inicio else datetime(2023, 1, 1)
     data_fim_dt = datetime.strptime(data_fim, '%Y-%m-%d') if data_fim else datetime.now()
     
-    # Generate monthly intervals
+    # Gera intervalos mensais
     intervalos = []
     current_date = data_inicio_dt
     while current_date < data_fim_dt:
-        next_month = current_date.replace(day=28) + timedelta(days=4)  # Move to next month
-        next_month = next_month.replace(day=1)  # First day of next month
-        end_date = min(next_month - timedelta(days=1), data_fim_dt)  # Last day of current month or data_fim
+        next_month = current_date.replace(day=28) + timedelta(days=4)  # Move para o próximo mês
+        next_month = next_month.replace(day=1)  # Primeiro dia do próximo mês
+        end_date = min(next_month - timedelta(days=1), data_fim_dt)  # Último dia do mês corrente ou data_fim
         
         intervalos.append((
             current_date.strftime('%Y-%m-%d'),
@@ -138,12 +138,15 @@ def extract_votacoes(mode: str = "full", data_inicio: Optional[str] = None, data
         
         current_date = next_month
     
-    # Fetch data for each interval
+    # Busca dados para cada intervalo
     all_votacoes = []
     
     for inicio, fim in tqdm(intervalos, desc="Extracting votacoes by interval"):
         logger.info(f"Fetching votacoes from {inicio} to {fim}")
-        votacoes_interval = obter_votacoes(dataInicio=inicio, dataFim=fim)
+        
+        url = 'https://dadosabertos.camara.leg.br/api/v2/votacoes'
+        parametros = {'dataInicio': inicio, 'dataFim': fim}
+        votacoes_interval = fazer_requisicao(url, parametros)
         
         if votacoes_interval is not None and not votacoes_interval.empty:
             all_votacoes.append(votacoes_interval)
@@ -154,13 +157,13 @@ def extract_votacoes(mode: str = "full", data_inicio: Optional[str] = None, data
         logger.warning("No votacoes data found")
         return None
     
-    # Concatenate all intervals
+    # Concatena todos os intervalos
     df_votacoes = pd.concat(all_votacoes, ignore_index=True)
     
-    # Save raw data to disk
+    # Salva dados brutos em disco
     save_dataframe(df_votacoes, "votacoes")
     
-    # Update last update date
+    # Atualiza data da última atualização
     update_last_update_date("votacoes", data_fim)
     
     return df_votacoes
@@ -168,24 +171,24 @@ def extract_votacoes(mode: str = "full", data_inicio: Optional[str] = None, data
 @task(name="Extract Votos")
 def extract_votos(df_votacoes: Optional[pd.DataFrame] = None, mode: str = "full") -> pd.DataFrame:
     """
-    Extract votes for each voting session.
+    Extrai votos para cada sessão de votação.
     
     Args:
-        df_votacoes: DataFrame with voting sessions
-        mode: 'full' for all votacoes, 'incremental' for recent votacoes
+        df_votacoes: DataFrame com sessões de votação
+        mode: 'full' para todas as votações, 'incremental' para votações recentes
         
     Returns:
-        DataFrame with votes data
+        DataFrame com dados dos votos
     """
     if df_votacoes is None:
-        # Try to load from disk if not provided
+        # Tenta carregar do disco se não for fornecido
         df_votacoes = load_dataframe("votacoes")
     
     if df_votacoes is None or df_votacoes.empty:
         logger.warning("No votacoes data available for extracting votos")
         return None
     
-    # For incremental mode, filter to recent votacoes
+    # Para modo incremental, filtra para votações recentes
     if mode == "incremental":
         last_update = get_last_update_date("votos")
         if last_update:
@@ -198,7 +201,8 @@ def extract_votos(df_votacoes: Optional[pd.DataFrame] = None, mode: str = "full"
     all_votos = []
     
     for votacao_id in tqdm(votacao_ids, desc="Extracting votos"):
-        votos = obter_votos_votacao(votacao_id)
+        url = f'https://dadosabertos.camara.leg.br/api/v2/votacoes/{votacao_id}/votos'
+        votos = fazer_requisicao(url)
         
         if votos is not None and not votos.empty:
             votos['idVotacao'] = votacao_id
@@ -210,70 +214,71 @@ def extract_votos(df_votacoes: Optional[pd.DataFrame] = None, mode: str = "full"
         logger.warning("No votos data found")
         return None
     
-    # Concatenate all votes
+    # Concatena todos os votos
     df_votos = pd.concat(all_votos, ignore_index=True)
     
-    # Save raw data to disk
+    # Salva dados brutos em disco
     save_dataframe(df_votos, "votos")
     
-    # Update last update date
+    # Atualiza data da última atualização
     update_last_update_date("votos")
     
     return df_votos
 
-
 @task(name="Extract Discursos")
-def extract_discursos(df_deputados : Optional[pd.DataFrame] = None, mode: str = "full" ) -> pd.DataFrame:
+def extract_discursos(df_deputados: Optional[pd.DataFrame] = None, mode: str = "full") -> pd.DataFrame:
     """
-    Extract speeches for each deputy.
+    Extrai discursos para cada deputado.
 
     Args:
-        df_deputados: DataFrame with deputies
-        mode: 'full' for all deputados, 'incremental' for recent deputados
+        df_deputados: DataFrame com deputados
+        mode: 'full' para todos os deputados, 'incremental' para deputados recentes
     Returns:
-        DataFrame with speeches data
+        DataFrame com dados dos discursos
     """
     if df_deputados is None:
-        # Try to load from disk if not provided
+        # Tenta carregar do disco se não for fornecido
         df_deputados = load_dataframe("deputados")
 
     if df_deputados is None or df_deputados.empty:
         logger.warning("No deputados data available for extracting speeches")
         return None
     
-    # For incremental mode, filter to recent deputados
+    # Para modo incremental, filtra para deputados recentes
     if mode == "incremental":
         last_update = get_last_update_date("discursos")
         if last_update:
             last_update_dt = datetime.strptime(last_update, '%Y-%m-%d')
-            df_deputados = df_deputados[pd.to_datetime(df_deputados['data']).dt.date >= last_update_dt.date()]
+            # Tenta filtrar com base na data, se estiver disponível
+            if 'data' in df_deputados.columns:
+                df_deputados = df_deputados[pd.to_datetime(df_deputados['data']).dt.date >= last_update_dt.date()]
 
     deputados_ids = df_deputados['id'].unique().tolist()
     logger.info(f"Extracting discursos for {len(deputados_ids)} deputados")
 
     all_discursos = []
 
-    for discurso_id in tqdm(deputados_ids, desc="Extracting discursos"):
-        discursos = obter_discursos_deputado(id=discurso_id)
+    for deputado_id in tqdm(deputados_ids, desc="Extracting discursos"):
+        url = f'https://dadosabertos.camara.leg.br/api/v2/deputados/{deputado_id}/discursos'
+        discursos = fazer_requisicao(url)
 
         if discursos is not None and not discursos.empty:
-            discursos['idDeputado'] = discurso_id
+            discursos['idDeputado'] = deputado_id
             all_discursos.append(discursos)
         else:
-            logger.warning(f"No discursos found for deputado {discurso_id}")
-
+            logger.warning(f"No discursos found for deputado {deputado_id}")
 
     if not all_discursos:
         logger.warning("No discursos data found")
         return None
     
-    # Concatenate all speeches
+    # Concatena todos os discursos
     df_discursos = pd.concat(all_discursos, ignore_index=True)
 
-    # Save raw data to disk
+    # Salva dados brutos em disco
     save_dataframe(df_discursos, "discursos")
 
-    # Update last update date
+    # Atualiza data da última atualização
     update_last_update_date("discursos")
 
     return df_discursos

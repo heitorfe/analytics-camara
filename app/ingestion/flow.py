@@ -6,12 +6,11 @@ from prefect import flow, get_run_logger
 
 from app.ingestion.extract import (
     extract_deputados,
-    extract_deputados_details,
     extract_votacoes,
     extract_votos,
     extract_discursos
 )
-from app.ingestion.transform_tasks import (
+from app.ingestion.transform import (
     transform_deputados,
     transform_deputados_details,
     transform_votacoes,
@@ -40,13 +39,14 @@ def deputados_etl_flow(mode: str = "full") -> Dict[str, int]:
     logger = get_run_logger()
     logger.info(f"Starting deputados ETL flow in {mode} mode")
     
-    # Extract
+    # Extract - agora extrai deputados e seus detalhes em uma única chamada
     logger.info("Starting extraction phase for deputados")
-    df_deputados = extract_deputados(mode=mode)
-    df_details = extract_deputados_details(df_deputados=df_deputados)
+    df_details = extract_deputados(mode=mode)
     
     # Transform
     logger.info("Starting transformation phase for deputados")
+    # Carrega o DataFrame de deputados básicos do disco para transformação
+    df_deputados = df_details  # Pode ajustar conforme necessário se precisar separar os dados
     df_deputados_clean = transform_deputados(df_deputados=df_deputados)
     df_details_clean = transform_deputados_details(df_detalhes=df_details)
     
@@ -226,7 +226,13 @@ def camara_analytics_etl_flow(
     
     if "discursos" in entities:
         # If we processed deputados, we can pass the DataFrame directly
-        df_deputados = None if "deputados" not in entities else extract_deputados.fn(mode=mode)
+        # Carrega do disco em vez de reutilizar o DataFrame anterior, pois extract_deputados agora retorna detalhes
+        df_deputados = None
+        if "deputados" in entities:
+            # Carrega os dados básicos de deputados do disco
+            from app.ingestion.utils import load_dataframe
+            df_deputados = load_dataframe("deputados")
+        
         stats["discursos"] = discursos_etl_flow(mode=mode, df_deputados=df_deputados)
 
     logger.info(f"Camara Analytics ETL flow completed with stats: {stats}")

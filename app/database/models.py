@@ -11,6 +11,7 @@ class Deputado(Base):
     nome_civil = Column(String, nullable=False)
     cpf = Column(String, nullable=True)
     sexo = Column(String, nullable=True)
+    escolaridade = Column(String, nullable=True)
     url_website = Column(String, nullable=True)
     data_nascimento = Column(Date, nullable=True)
     data_falecimento = Column(Date, nullable=True)
@@ -77,7 +78,7 @@ class Discurso(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     deputado_id = Column(Integer, ForeignKey("deputados.id"), nullable=False)
-    data_hora_inicio = Column(DateTime, nullable=False)
+    data_hora_inicio = Column(DateTime, nullable=True)
     data_hora_fim = Column(DateTime, nullable=True)
     fase_evento = Column(JSON, nullable=True)
     tipo_discurso = Column(String, nullable=False)

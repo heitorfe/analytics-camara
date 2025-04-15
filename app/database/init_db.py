@@ -3,8 +3,8 @@ import logging
 from sqlalchemy.orm import Session
 from .database import engine, SessionLocal
 from .models import Base
-from app.ingestion.extract import extract_deputados, extract_deputados_details, extract_votacoes, extract_votos
-from app.ingestion.transform import transform_deputados, transform_deputados_details, transform_votacoes, transform_votos
+from app.ingestion.extract import extract_deputados, extract_votacoes, extract_votos
+from app.ingestion.transform import transform_deputados, transform_votacoes, transform_votos
 from app.ingestion.load import load_deputados, load_votacoes, load_votos
 
 logger = logging.getLogger(__name__)
@@ -28,20 +28,18 @@ def init_db():
         db = SessionLocal()
         
         try:
-            # Extract data
+            # Extract data - unified approach for deputados
             df_deputados = extract_deputados.fn(mode="full")
-            df_details = extract_deputados_details.fn(df_deputados=df_deputados)
             df_votacoes = extract_votacoes.fn(mode="full", data_inicio="2023-01-01")
             df_votos = extract_votos.fn(df_votacoes=df_votacoes, mode="full")
             
-            # Transform data
+            # Transform data - unified approach for deputados
             df_deputados_clean = transform_deputados.fn(df_deputados=df_deputados)
-            df_details_clean = transform_deputados_details.fn(df_detalhes=df_details)
             df_votacoes_clean = transform_votacoes.fn(df_votacoes=df_votacoes)
             df_votos_clean = transform_votos.fn(df_votos=df_votos)
             
             # Load data
-            deputados_loaded = load_deputados.fn(df_deputados_clean=df_deputados_clean, df_details_clean=df_details_clean)
+            deputados_loaded = load_deputados.fn(df_deputados_clean=df_deputados_clean)
             votacoes_loaded = load_votacoes.fn(df_votacoes_clean=df_votacoes_clean)
             votos_loaded = load_votos.fn(df_votos_clean=df_votos_clean)
             

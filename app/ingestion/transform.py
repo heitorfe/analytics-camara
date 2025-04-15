@@ -23,41 +23,53 @@ def transform_deputado(data: Union[Dict, pd.DataFrame]) -> Deputado:
         Deputado: Database model instance
     """
     try:
-         # Add ultimo_status fields if present
+        # Handle ultimo_status data
         ultimo_status = data.get('ultimoStatus', data.get('ultimo_status', {}))
+        if isinstance(ultimo_status, str) and ultimo_status.startswith('{'):
+            # Handle case where ultimo_status might be a JSON string
+            import json
+            try:
+                ultimo_status = json.loads(ultimo_status)
+            except:
+                ultimo_status = {}
         
-        # Create base deputado object with handling for different key formats
+        # Handle gabinete data properly as JSON field
+        gabinete = ultimo_status.get('gabinete', {})
+        
+        # Create the deputado object with only valid fields from the schema
         deputado = Deputado(
             id=data['id'],
             uri=data.get('uri', ''),
-            nome_civil=data.get('nomeCivil', data.get('nome', '')),
+            nome_civil=data.get('nomeCivil', data.get('nome_civil', data.get('nome', ''))),
             cpf=data.get('cpf'),
             sexo=data.get('sexo'),
+            escolaridade=data.get('escolaridade'),
             url_website=data.get('urlWebsite', data.get('url_website')),
             data_nascimento=data.get('dataNascimento', data.get('data_nascimento')),
             data_falecimento=data.get('dataFalecimento', data.get('data_falecimento')),
             uf_nascimento=data.get('ufNascimento', data.get('uf_nascimento')),
-            municipio_nascimento=data.get('municipioNascimento', data.get('municipio_nascimento'))
+            municipio_nascimento=data.get('municipioNascimento', data.get('municipio_nascimento')),
+            
+            # UltimoStatus fields
+            ultimo_status_id=ultimo_status.get('id'),
+            ultimo_status_nome=ultimo_status.get('nome', data.get('nome')),
+            ultimo_status_sigla_partido=ultimo_status.get('siglaPartido', data.get('siglaPartido')),
+            ultimo_status_uri_partido=ultimo_status.get('uriPartido', data.get('uriPartido')),
+            ultimo_status_sigla_uf=ultimo_status.get('siglaUf', data.get('siglaUf')),
+            ultimo_status_id_legislatura=ultimo_status.get('idLegislatura', data.get('idLegislatura')),
+            ultimo_status_url_foto=ultimo_status.get('urlFoto', data.get('urlFoto')),
+            ultimo_status_email=ultimo_status.get('email', data.get('email')),
+            ultimo_status_data=ultimo_status.get('data'),
+            ultimo_status_nome_eleitoral=ultimo_status.get('nomeEleitoral'),
+            ultimo_status_situacao=ultimo_status.get('situacao'),
+            ultimo_status_condicao_eleitoral=ultimo_status.get('condicaoEleitoral'),
+            ultimo_status_descricao=ultimo_status.get('descricaoStatus'),
+            
+            # Gabinete is a JSON field, not individual fields
+            ultimo_status_gabinete=gabinete
         )
         
-       
-        if ultimo_status:
-            deputado.ultimo_status_id = ultimo_status.get('id')
-            deputado.ultimo_status_nome = ultimo_status.get('nome')
-            deputado.ultimo_status_sigla_partido = ultimo_status.get('siglaPartido', ultimo_status.get('sigla_partido'))
-            deputado.ultimo_status_uri_partido = ultimo_status.get('uriPartido', ultimo_status.get('uri_partido'))
-            deputado.ultimo_status_sigla_uf = ultimo_status.get('siglaUf', ultimo_status.get('sigla_uf'))
-            deputado.ultimo_status_id_legislatura = ultimo_status.get('idLegislatura', ultimo_status.get('id_legislatura'))
-            deputado.ultimo_status_url_foto = ultimo_status.get('urlFoto', ultimo_status.get('url_foto'))
-            deputado.ultimo_status_email = ultimo_status.get('email')
-            deputado.ultimo_status_data = ultimo_status.get('data')
-            deputado.ultimo_status_nome_eleitoral = ultimo_status.get('nomeEleitoral', ultimo_status.get('nome_eleitoral'))
-            deputado.ultimo_status_gabinete = ultimo_status.get('gabinete')
-            deputado.ultimo_status_situacao = ultimo_status.get('situacao')
-            deputado.ultimo_status_condicao_eleitoral = ultimo_status.get('condicaoEleitoral', ultimo_status.get('condicao_eleitoral'))
-            deputado.ultimo_status_descricao = ultimo_status.get('descricaoStatus', ultimo_status.get('descricao_status'))
-        
-        # Also try to get values that might be directly at the top level
+        # Alternative field sources if primary fields are not available
         if not deputado.ultimo_status_nome:
             deputado.ultimo_status_nome = data.get('nome')
         if not deputado.ultimo_status_sigla_partido:
@@ -249,13 +261,13 @@ def transform_dataframe_to_models(df: pd.DataFrame, transform_func, **kwargs) ->
 @task(name="Transform Deputados")
 def transform_deputados(df_deputados: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
-    Transform deputies data.
+    Transform deputies data from API format to a format suitable for database loading.
     
     Args:
         df_deputados: Raw DataFrame with deputies data
         
     Returns:
-        Transformed DataFrame
+        Transformed DataFrame ready for database loading
     """
     if df_deputados is None:
         df_deputados = load_dataframe("deputados")
@@ -266,127 +278,68 @@ def transform_deputados(df_deputados: Optional[pd.DataFrame] = None) -> pd.DataF
     
     logger.info(f"Transforming {len(df_deputados)} deputados")
     
-    try:
-        # Select necessary columns (using get to handle missing columns)
-        columns = ['id', 'uri', 'nome', 'siglaPartido', 'siglaUf', 'idLegislatura', 'urlFoto', 'email']
-        df_clean = pd.DataFrame()
-        
-        # Add columns safely
-        for col in columns:
-            if col in df_deputados.columns:
-                df_clean[col] = df_deputados[col]
-            else:
-                # Try alternative column names using snake_case
-                snake_case = ''.join(['_' + c.lower() if c.isupper() else c for c in col]).lstrip('_')
-                if snake_case in df_deputados.columns:
-                    df_clean[col] = df_deputados[snake_case]
-                else:
-                    logger.warning(f"Column {col} not found, setting to empty")
-                    df_clean[col] = None
-        
-        # Ensure ID is always present
-        if 'id' not in df_clean.columns or df_clean['id'].isnull().all():
-            raise ValueError("ID column is missing or all null")
+    # Create result DataFrame with the structure matching the database model
+    result = []
+    
+    for _, row in df_deputados.iterrows():
+        try:
+            # Extract ultimo_status data from the nested JSON or dict
+            ultimo_status = row.get('ultimo_status', {})
+            if isinstance(ultimo_status, str):
+                # Handle case where ultimo_status might be a JSON string
+                try:
+                    import json
+                    ultimo_status = json.loads(ultimo_status)
+                except:
+                    ultimo_status = {}
             
-        # Convert data types safely
-        df_clean = df_clean.convert_dtypes()
-        
-        # Save processed data
-        save_dataframe(df_clean, "deputados", processed=True)
-        
-        return df_clean
-    
-    except Exception as e:
-        logger.error(f"Error transforming deputados: {e}")
-        # Return a minimal dataframe with just the IDs if possible
-        if 'id' in df_deputados.columns:
-            return pd.DataFrame({'id': df_deputados['id']})
-        return None
-
-@task(name="Transform Deputados Details")
-def transform_deputados_details(df_detalhes: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """
-    Transform deputies details data.
-    
-    Args:
-        df_detalhes: Raw DataFrame with deputies details
-        
-    Returns:
-        Transformed DataFrame
-    """
-    if df_detalhes is None:
-        df_detalhes = load_dataframe("detalhes_deputados")
-    
-    if df_detalhes is None or df_detalhes.empty:
-        logger.warning("No deputados details data available for transformation")
-        return None
-    
-    logger.info(f"Transforming {len(df_detalhes)} deputados details")
-    
-    try:
-        # Create a new DataFrame with required columns
-        df_clean = pd.DataFrame()
-        
-        # Always ensure ID is present
-        if 'id' in df_detalhes.columns:
-            df_clean['id'] = df_detalhes['id']
-        else:
-            logger.error("ID column missing from detalhes_deputados")
-            return None
-        
-        # Copy basic columns with fallbacks
-        columns = {
-            'nomeCivil': 'nomeCivil', 
-            'dataNascimento': 'dataNascimento', 
-            'municipioNascimento': 'municipioNascimento', 
-            'ufNascimento': 'ufNascimento', 
-            'escolaridade': 'escolaridade', 
-            'sexo': 'sexo'
-        }
-        
-        for col, api_col in columns.items():
-            if api_col in df_detalhes.columns:
-                df_clean[col] = df_detalhes[api_col]
-            else:
-                # Try snake_case version
-                snake_case = ''.join(['_' + c.lower() if c.isupper() else c for c in api_col]).lstrip('_')
-                if snake_case in df_detalhes.columns:
-                    df_clean[col] = df_detalhes[snake_case]
-                else:
-                    df_clean[col] = None
-        
-        # Handle ultimoStatus column which might be a nested dict
-        if 'ultimoStatus' in df_detalhes.columns:
-            # Check if it's a Series of dicts or already a DataFrame
-            if isinstance(df_detalhes['ultimoStatus'].iloc[0], dict):
-                ultimo_status_df = pd.json_normalize(df_detalhes['ultimoStatus'])
+            # Direct conversion from API fields to database fields
+            deputado_dict = {
+                # Basic fields
+                'id': row['id'],
+                'uri': row.get('uri', ''),
+                'nome_civil': row.get('nomeCivil', row.get('nome', '')),
+                'cpf': row.get('cpf'),
+                'sexo': row.get('sexo'),
+                'escolaridade': row.get('escolaridade'),
+                'url_website': row.get('urlWebsite', row.get('url_website')),
+                'data_nascimento': row.get('dataNascimento', row.get('data_nascimento')),
+                'data_falecimento': row.get('dataFalecimento', row.get('data_falecimento')),
+                'uf_nascimento': row.get('ufNascimento', row.get('uf_nascimento')),
+                'municipio_nascimento': row.get('municipioNascimento', row.get('municipio_nascimento')),
                 
-                # Extract relevant fields
-                if 'condicaoEleitoral' in ultimo_status_df.columns:
-                    df_clean['condicaoEleitoral'] = ultimo_status_df['condicaoEleitoral']
-                if 'situacao' in ultimo_status_df.columns:
-                    df_clean['situacao'] = ultimo_status_df['situacao']
-                if 'data' in ultimo_status_df.columns:
-                    df_clean['dataUltimoStatus'] = ultimo_status_df['data']
-                if 'gabinete.telefone' in ultimo_status_df.columns:
-                    df_clean['telefone'] = ultimo_status_df['gabinete.telefone']
-                if 'siglaPartido' in ultimo_status_df.columns:
-                    df_clean['siglaPartido'] = ultimo_status_df['siglaPartido']
-        
-        # Convert data types safely
-        df_clean = df_clean.convert_dtypes()
-        
-        # Save processed data
-        save_dataframe(df_clean, "detalhes_deputados", processed=True)
-        
-        return df_clean
+                # UltimoStatus fields
+                'ultimo_status_id': ultimo_status.get('id'),
+                'ultimo_status_nome': ultimo_status.get('nome', row.get('nome')),
+                'ultimo_status_sigla_partido': ultimo_status.get('siglaPartido', row.get('siglaPartido')),
+                'ultimo_status_uri_partido': ultimo_status.get('uriPartido', row.get('uriPartido')),
+                'ultimo_status_sigla_uf': ultimo_status.get('siglaUf', row.get('siglaUf')),
+                'ultimo_status_id_legislatura': ultimo_status.get('idLegislatura', row.get('idLegislatura')),
+                'ultimo_status_url_foto': ultimo_status.get('urlFoto', row.get('urlFoto')),
+                'ultimo_status_email': ultimo_status.get('email', row.get('email')),
+                'ultimo_status_data': ultimo_status.get('data'),
+                'ultimo_status_nome_eleitoral': ultimo_status.get('nomeEleitoral'),
+                'ultimo_status_situacao': ultimo_status.get('situacao'),
+                'ultimo_status_condicao_eleitoral': ultimo_status.get('condicaoEleitoral'),
+                'ultimo_status_descricao': ultimo_status.get('descricaoStatus')
+            }
+            
+            # Handle gabinete data if present
+            gabinete = ultimo_status.get('gabinete', {})
+            if gabinete and isinstance(gabinete, dict):
+                deputado_dict['ultimo_status_gabinete'] = gabinete
+            
+            result.append(deputado_dict)
+        except Exception as e:
+            logger.error(f"Error transforming deputado record: {e}")
     
-    except Exception as e:
-        logger.error(f"Error transforming deputados details: {e}")
-        # Return a minimal dataframe with just the IDs if possible
-        if 'id' in df_detalhes.columns:
-            return pd.DataFrame({'id': df_detalhes['id']})
-        return None
+    # Convert to DataFrame
+    df_clean = pd.DataFrame(result)
+    
+    # Save processed data
+    save_dataframe(df_clean, "deputados", processed=True)
+    
+    return df_clean
 
 @task(name="Transform Votacoes")
 def transform_votacoes(df_votacoes: Optional[pd.DataFrame] = None) -> pd.DataFrame:

@@ -35,22 +35,18 @@ def get_db_session() -> Tuple[Session, Any]:
         raise
 
 @task(name="Load Deputados", retries=3, retry_delay_seconds=30)
-def load_deputados(df_deputados_clean: Optional[pd.DataFrame] = None, df_details_clean: Optional[pd.DataFrame] = None) -> int:
+def load_deputados(df_deputados_clean: Optional[pd.DataFrame] = None) -> int:
     """
-    Load deputies data into the database.
+    Load deputies data into the database. Adds new records and updates existing ones.
     
     Args:
-        df_deputados_clean: Processed DataFrame with basic deputies data
-        df_details_clean: Processed DataFrame with detailed deputies data
+        df_deputados_clean: Processed DataFrame with deputies data
         
     Returns:
         Number of deputies loaded
     """
     if df_deputados_clean is None:
         df_deputados_clean = load_dataframe("deputados", processed=True)
-    
-    if df_details_clean is None:
-        df_details_clean = load_dataframe("detalhes_deputados", processed=True)
     
     if df_deputados_clean is None or df_deputados_clean.empty:
         logger.warning("No processed deputados data available for loading")
@@ -65,127 +61,38 @@ def load_deputados(df_deputados_clean: Optional[pd.DataFrame] = None, df_details
         logger.error(f"Failed to connect to database: {e}")
         return 0
     
-    num_new = 0
-    num_updated = 0
-    
     try:
-        # First, determine which deputies are new (not in the database)
-        existing_ids_query = text("SELECT id FROM deputados")
-        try:
-            existing_ids = {row[0] for row in db.execute(existing_ids_query)}
-        except SQLAlchemyError as e:
-            logger.error(f"Error querying existing deputies: {e}")
-            existing_ids = set()
-        
-        # Get the list of all IDs from the DataFrame
-        all_ids = set(df_deputados_clean['id'].unique())
-        
-        # Determine new and existing deputies
-        new_ids = all_ids - existing_ids
-        existing_ids_to_update = all_ids & existing_ids
-        
-        logger.info(f"Found {len(new_ids)} new deputados and {len(existing_ids_to_update)} existing deputados to update")
-        
-        # Process for insertion/update
-        deputados_to_add = []
-        
-        # Add new deputies
-        for _, row in df_deputados_clean[df_deputados_clean['id'].isin(new_ids)].iterrows():
+        # Transform DataFrame records to list of SQLAlchemy models
+        deputados_to_load = []
+        for _, row in df_deputados_clean.iterrows():
             try:
                 row_dict = row.to_dict()
-                
-                # Merge with details if available
-                if df_details_clean is not None and not df_details_clean.empty:
-                    details_row = df_details_clean[df_details_clean['id'] == row_dict['id']]
-                    if not details_row.empty:
-                        # Convert details row to dictionary
-                        details_dict = details_row.iloc[0].to_dict()
-                        # Make sure we have a nomeCivil
-                        if 'nomeCivil' in details_dict and details_dict['nomeCivil']:
-                            row_dict['nomeCivil'] = details_dict['nomeCivil']
-                        else:
-                            # Use nome as fallback for nomeCivil if needed
-                            row_dict['nomeCivil'] = row_dict.get('nome', '')
-                        # Update row_dict with details
-                        row_dict.update({
-                            'sexo': details_dict.get('sexo'),
-                            'dataNascimento': details_dict.get('dataNascimento'),
-                            'ufNascimento': details_dict.get('ufNascimento'),
-                            'municipioNascimento': details_dict.get('municipioNascimento'),
-                        })
-                else:
-                    # Make sure we have a nomeCivil even without details
-                    row_dict['nomeCivil'] = row_dict.get('nome', '')
-                
-                # Transform to SQLAlchemy model
                 deputado = transform_deputado(row_dict)
-                deputados_to_add.append(deputado)
+                deputados_to_load.append(deputado)
             except Exception as e:
-                logger.error(f"Error processing deputado {row.get('id', 'unknown')}: {e}")
+                logger.error(f"Error transforming deputado record {row.get('id', 'unknown')}: {e}")
         
-        # Update existing deputies
-        for _, row in df_deputados_clean[df_deputados_clean['id'].isin(existing_ids_to_update)].iterrows():
+        # Use SQLAlchemy's merge operation for each record
+        # This will update existing records and create new ones
+        num_loaded = 0
+        for deputado in deputados_to_load:
             try:
-                row_dict = row.to_dict()
-                
-                # Get the existing deputy from the database
-                existing_deputado = db.query(Deputado).filter(Deputado.id == row_dict['id']).first()
-                
-                if existing_deputado:
-                    # Update basic fields
-                    existing_deputado.uri = row_dict.get('uri', existing_deputado.uri)
-                    existing_deputado.ultimo_status_nome = row_dict.get('nome', existing_deputado.ultimo_status_nome)
-                    existing_deputado.ultimo_status_sigla_partido = row_dict.get('siglaPartido', existing_deputado.ultimo_status_sigla_partido)
-                    existing_deputado.ultimo_status_sigla_uf = row_dict.get('siglaUf', existing_deputado.ultimo_status_sigla_uf)
-                    existing_deputado.ultimo_status_id_legislatura = row_dict.get('idLegislatura', existing_deputado.ultimo_status_id_legislatura)
-                    existing_deputado.ultimo_status_url_foto = row_dict.get('urlFoto', existing_deputado.ultimo_status_url_foto)
-                    existing_deputado.ultimo_status_email = row_dict.get('email', existing_deputado.ultimo_status_email)
-                    
-                    # Update with details if available
-                    if df_details_clean is not None and not df_details_clean.empty:
-                        details_row = df_details_clean[df_details_clean['id'] == row_dict['id']]
-                        if not details_row.empty:
-                            details_dict = details_row.iloc[0].to_dict()
-                            if 'nomeCivil' in details_dict and details_dict['nomeCivil']:
-                                existing_deputado.nome_civil = details_dict['nomeCivil']
-                            existing_deputado.sexo = details_dict.get('sexo', existing_deputado.sexo)
-                            existing_deputado.data_nascimento = details_dict.get('dataNascimento', existing_deputado.data_nascimento)
-                            existing_deputado.uf_nascimento = details_dict.get('ufNascimento', existing_deputado.uf_nascimento)
-                            existing_deputado.municipio_nascimento = details_dict.get('municipioNascimento', existing_deputado.municipio_nascimento)
-                            existing_deputado.ultimo_status_condicao_eleitoral = details_dict.get('condicaoEleitoral', existing_deputado.ultimo_status_condicao_eleitoral)
-                            existing_deputado.ultimo_status_situacao = details_dict.get('situacao', existing_deputado.ultimo_status_situacao)
-                            existing_deputado.ultimo_status_data = details_dict.get('dataUltimoStatus', existing_deputado.ultimo_status_data)
-                    
-                    num_updated += 1
+                db.merge(deputado)  # Updates if exists, inserts if new
+                num_loaded += 1
             except Exception as e:
-                logger.error(f"Error updating deputado {row.get('id', 'unknown')}: {e}")
+                logger.error(f"Error merging deputado {deputado.id}: {e}")
         
-        # Commit new deputies to database
-        try:
-            num_new = commit_to_db(db, deputados_to_add, "deputados (new)")
-            db.commit()  # Commit updates
-        except IntegrityError as e:
-            db.rollback()
-            logger.error(f"Integrity error loading deputados: {e}")
-            # Try inserting one by one to salvage what we can
-            num_new = 0
-            for deputado in deputados_to_add:
-                try:
-                    db.add(deputado)
-                    db.commit()
-                    num_new += 1
-                except IntegrityError:
-                    db.rollback()
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Error committing deputados: {e}")
+        # Commit all changes
+        db.commit()
         
-        return num_new + num_updated
+        logger.info(f"Successfully loaded {num_loaded} deputados")
+        return num_loaded
     
     except Exception as e:
         db.rollback()
         logger.error(f"Error loading deputados: {e}")
         return 0
+    
     finally:
         db.close()
         engine.dispose()
@@ -574,5 +481,5 @@ def load_discursos(df_discursos_clean: Optional[pd.DataFrame] = None) -> int:
         engine.dispose()
 
 
-    
+
 

@@ -12,7 +12,6 @@ from app.ingestion.extract import (
 )
 from app.ingestion.transform import (
     transform_deputados,
-    transform_deputados_details,
     transform_votacoes,
     transform_votos,
     transform_discursos
@@ -29,6 +28,7 @@ from app.config import YESTERDAY, TODAY
 def deputados_etl_flow(mode: str = "full") -> Dict[str, int]:
     """
     Flow for extracting, transforming, and loading deputies data.
+    Uses a unified approach that treats basic and detailed data as a single entity.
     
     Args:
         mode: 'full' for full extraction, 'incremental' for incremental
@@ -39,27 +39,26 @@ def deputados_etl_flow(mode: str = "full") -> Dict[str, int]:
     logger = get_run_logger()
     logger.info(f"Starting deputados ETL flow in {mode} mode")
     
-    # Extract - agora extrai deputados e seus detalhes em uma única chamada
+    # Extract - unified extraction directly from detailed endpoint
     logger.info("Starting extraction phase for deputados")
-    df_details = extract_deputados(mode=mode)
+    df_deputados = extract_deputados(mode=mode)
+    
+    if df_deputados is None or df_deputados.empty:
+        logger.warning("No deputados data extracted")
+        return {"deputados_extracted": 0, "deputados_loaded": 0}
     
     # Transform
     logger.info("Starting transformation phase for deputados")
-    # Carrega o DataFrame de deputados básicos do disco para transformação
-    df_deputados = df_details  # Pode ajustar conforme necessário se precisar separar os dados
+    # Transform deputies data using the unified format
     df_deputados_clean = transform_deputados(df_deputados=df_deputados)
-    df_details_clean = transform_deputados_details(df_detalhes=df_details)
     
     # Load
     logger.info("Starting loading phase for deputados")
     num_loaded = load_deputados(
-        df_deputados_clean=df_deputados_clean,
-        df_details_clean=df_details_clean
-    )
+        df_deputados_clean=df_deputados_clean    )
     
     stats = {
         "deputados_extracted": len(df_deputados) if df_deputados is not None else 0,
-        "deputados_details_extracted": len(df_details) if df_details is not None else 0,
         "deputados_loaded": num_loaded
     }
     

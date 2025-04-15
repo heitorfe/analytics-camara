@@ -45,8 +45,8 @@ def fazer_requisicao(url, parametros=None, returnar_df=True):
 @task(name="Extract Deputados")
 def extract_deputados(mode: str = "full") -> pd.DataFrame:
     """
-    Extrai dados de deputados da API da Câmara e já inclui os detalhes de cada deputado.
-    Consolida as antigas funções extract_deputados e extract_deputados_details.
+    Extrai dados de deputados diretamente da API de detalhes da Câmara.
+    Esta função unifica a extração de dados básicos e detalhados dos deputados.
     
     Args:
         mode: 'full' para extração completa, 'incremental' para incremental
@@ -54,46 +54,94 @@ def extract_deputados(mode: str = "full") -> pd.DataFrame:
     Returns:
         DataFrame com dados detalhados dos deputados
     """
-    logger.info(f"Extracting deputados with details in {mode} mode")
+    logger.info(f"Extracting deputados with unified approach in {mode} mode")
     
-    # 1. Primeiro obtém a lista básica de deputados
+    # Primeiro obtém a lista de IDs de deputados ativos
     url = 'https://dadosabertos.camara.leg.br/api/v2/deputados'
-    df_deputados_basico = fazer_requisicao(url)
+    df_deputies_list = fazer_requisicao(url)
     
-    if df_deputados_basico is None or df_deputados_basico.empty:
-        logger.warning("No deputados data found")
+    if df_deputies_list is None or df_deputies_list.empty:
+        logger.warning("No deputados list found")
         return None
     
-    # Salva os dados básicos
-    save_dataframe(df_deputados_basico, "deputados")
-    update_last_update_date("deputados")
-    
-    # 2. Agora obtém os detalhes de cada deputado
-    deputados_details = []
-    ids = df_deputados_basico['id'].tolist()
+    # Agora obtém os detalhes completos para cada deputado
+    deputados_data = []
+    ids = df_deputies_list['id'].tolist()
     
     logger.info(f"Extracting details for {len(ids)} deputados")
     
-    for id in tqdm(ids, desc="Extracting deputados details"):
-        url = f'https://dadosabertos.camara.leg.br/api/v2/deputados/{id}'
-        detalhe = fazer_requisicao(url, returnar_df=False)
+    for deputy_id in tqdm(ids, desc="Extracting deputados details"):
+        url = f'https://dadosabertos.camara.leg.br/api/v2/deputados/{deputy_id}'
+        response = fazer_requisicao(url, returnar_df=False)
         
-        if detalhe and 'dados' in detalhe:
-            deputados_details.append(detalhe['dados'])
+        if response and 'dados' in response:
+            # Process the detailed data into a flattened structure
+            deputy_data = response['dados']
+            
+            # Extract ultimo_status fields
+            ultimo_status = deputy_data.get('ultimoStatus', {})
+            
+            # Create a flattened record
+            flat_data = {
+                # Basic info
+                'id': deputy_data.get('id'),
+                'uri': deputy_data.get('uri'),
+                'nomeCivil': deputy_data.get('nomeCivil'),
+                'cpf': deputy_data.get('cpf'),
+                'sexo': deputy_data.get('sexo'),
+                'urlWebsite': deputy_data.get('urlWebsite'),
+                'dataNascimento': deputy_data.get('dataNascimento'),
+                'dataFalecimento': deputy_data.get('dataFalecimento'),
+                'ufNascimento': deputy_data.get('ufNascimento'),
+                'municipioNascimento': deputy_data.get('municipioNascimento'),
+                'escolaridade': deputy_data.get('escolaridade'),
+                
+                # Include social media if available
+                'redeSocial': deputy_data.get('redeSocial', []),
+                
+                # Último status fields - mantém nomes originais da API para compatibilidade
+                'ultimo_status': ultimo_status,
+                'nome': ultimo_status.get('nome'),
+                'siglaPartido': ultimo_status.get('siglaPartido'),
+                'uriPartido': ultimo_status.get('uriPartido'),
+                'siglaUf': ultimo_status.get('siglaUf'),
+                'idLegislatura': ultimo_status.get('idLegislatura'),
+                'urlFoto': ultimo_status.get('urlFoto'),
+                'email': ultimo_status.get('email'),
+                'data': ultimo_status.get('data'),
+                'nomeEleitoral': ultimo_status.get('nomeEleitoral'),
+                'situacao': ultimo_status.get('situacao'),
+                'condicaoEleitoral': ultimo_status.get('condicaoEleitoral'),
+                'descricaoStatus': ultimo_status.get('descricaoStatus')
+            }
+            
+            # Add gabinete data if present
+            gabinete = ultimo_status.get('gabinete', {})
+            if gabinete:
+                flat_data['gabinete'] = gabinete
+                flat_data['gabinete_nome'] = gabinete.get('nome')
+                flat_data['gabinete_predio'] = gabinete.get('predio')
+                flat_data['gabinete_sala'] = gabinete.get('sala')
+                flat_data['gabinete_andar'] = gabinete.get('andar')
+                flat_data['gabinete_telefone'] = gabinete.get('telefone')
+                flat_data['gabinete_email'] = gabinete.get('email')
+            
+            deputados_data.append(flat_data)
         else:
-            logger.warning(f"No details found for deputado {id}")
+            logger.warning(f"No details found for deputado {deputy_id}")
     
-    if not deputados_details:
-        logger.warning("No deputado details found")
+    if not deputados_data:
+        logger.warning("No deputados details found")
         return None
     
-    df_details = pd.DataFrame(deputados_details)
+    # Create DataFrame with all data
+    df_deputados = pd.DataFrame(deputados_data)
     
-    # Salva os dados detalhados
-    save_dataframe(df_details, "detalhes_deputados")
-    update_last_update_date("detalhes_deputados")
+    # Save raw data
+    save_dataframe(df_deputados, "deputados")
+    update_last_update_date("deputados")
     
-    return df_details
+    return df_deputados
 
 @task(name="Extract Votacoes")
 def extract_votacoes(mode: str = "full", data_inicio: Optional[str] = None, data_fim: Optional[str] = None) -> pd.DataFrame:
